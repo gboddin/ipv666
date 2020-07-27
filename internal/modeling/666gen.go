@@ -2,22 +2,33 @@ package modeling
 
 import (
 	"fmt"
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
+	"github.com/google/gopacket/pcap"
 	"github.com/lavalamp-/ipv666/internal"
 	"github.com/lavalamp-/ipv666/internal/addressing"
 	"github.com/lavalamp-/ipv666/internal/logging"
 	"github.com/lavalamp-/ipv666/internal/persist"
+	"go.uber.org/ratelimit"
 	"github.com/spf13/viper"
+	"log"
 	"math"
 	"math/rand"
 	"net"
 	"sort"
 	"strings"
+	"time"
 )
 
 type ClusterModel struct {
 	ClusterSet			*ClusterSet					`msgpack:"c"`
 	NybbleCounts		[]map[uint8]int				`msgpack:"n"`
 	normalizedCounts	[][]uint8
+	PcapHandle          *pcap.Handle
+	IpSrc				net.IP
+	HwDst				net.HardwareAddr
+	Interface           *net.Interface
+
 }
 
 type ClusterSet struct {
@@ -57,9 +68,11 @@ type addrProcessFunc func(*net.IP) (bool, error)
 // Model
 
 func (clusterModel *ClusterModel) GenerateAddresses(generateCount int, jitter float64) []*net.IP {
+	log.Println(clusterModel.Interface)
 	addrTree := newAddressTree()
 	var toReturn []*net.IP
 	iteration := 0
+	RateLimiter := ratelimit.New(5000, ratelimit.WithoutSlack)
 	for {
 		if iteration % viper.GetInt("LogLoopEmitFreq") == 0 {
 			logging.Infof("Generating new candidate address %d using clustering model. Unique count size is %d.", iteration, addrTree.Size())
@@ -67,6 +80,15 @@ func (clusterModel *ClusterModel) GenerateAddresses(generateCount int, jitter fl
 		newAddr := clusterModel.GenerateAddress(jitter)
 		if addrTree.AddIP(newAddr) {
 			toReturn = append(toReturn, newAddr)
+			// send ack somehow
+			RateLimiter.Take()
+			clusterModel.sendPacket(newAddr.To16() ,80)
+			RateLimiter.Take()
+			clusterModel.sendPacket(newAddr.To16() ,8000)
+			RateLimiter.Take()
+			clusterModel.sendPacket(newAddr.To16() ,9200)
+			RateLimiter.Take()
+			clusterModel.sendPacket(newAddr.To16() ,27017)
 			if len(toReturn) >= generateCount {
 				break
 			}
@@ -855,4 +877,41 @@ func GetGenRangeFromIPs(fromIPs []*net.IP) *GenRange {
 	newRange := newGenRange(fromIPs[0])
 	newRange.AddIPs(fromIPs[1:])
 	return newRange
+}
+
+func (clusterModel *ClusterModel) sendPacket(ip net.IP, dport layers.TCPPort) {
+	buff := gopacket.NewSerializeBuffer()
+	eth := layers.Ethernet{
+		SrcMAC:       clusterModel.Interface.HardwareAddr,
+		DstMAC:       clusterModel.HwDst,
+		EthernetType: layers.EthernetTypeIPv6,
+	}
+	ip6 := layers.IPv6{
+		Version:    6,
+		NextHeader: layers.IPProtocolTCP,
+		HopLimit:   64,
+		SrcIP:      clusterModel.IpSrc,
+		DstIP:      ip,
+	}
+	tcp := layers.TCP{
+		SrcPort: 32332,
+		DstPort: dport, // will be incremented during the scan
+		SYN:     true,
+	}
+	err := tcp.SetNetworkLayerForChecksum(&ip6)
+	if err != nil {
+		log.Fatal(err)
+	}
+	err = gopacket.SerializeLayers(buff, gopacket.SerializeOptions{
+		FixLengths:       true,
+		ComputeChecksums: true,
+	}, &eth, &ip6, &tcp)
+	if err != nil {
+		log.Fatal(err)
+	}
+	err = clusterModel.PcapHandle.WritePacketData(buff.Bytes())
+	if err != nil {
+		log.Printf("Failed sending packet for %s:%d sleeping 10 secs and resuming ...", ip.String(), dport)
+		time.Sleep(10*time.Second)
+	}
 }
